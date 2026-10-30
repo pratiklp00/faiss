@@ -85,6 +85,8 @@ set(FAISS_SIMD_RVV_SRC
   utils/simd_impl/rabitq_rvv.cpp
   utils/distances_fused/rvv.cpp
 )
+set(FAISS_SIMD_VSX_SRC
+)
 # Select SIMD sources based on target architecture
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64)")
   set(FAISS_SIMD_SRC
@@ -96,6 +98,8 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
   set(FAISS_SIMD_SRC ${FAISS_SIMD_NEON_SRC} ${FAISS_SIMD_SVE_SRC})
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(riscv64|riscv)")
   set(FAISS_SIMD_SRC ${FAISS_SIMD_RVV_SRC})
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(ppc64le|ppc64|powerpc64le|powerpc64)")
+  set(FAISS_SIMD_SRC ${FAISS_SIMD_VSX_SRC})
 else()
   set(FAISS_SIMD_SRC "")
 endif()
@@ -649,6 +653,15 @@ if(FAISS_OPT_LEVEL STREQUAL "dd")
         PROPERTIES COMPILE_OPTIONS "-march=rv64gcv_zvfhmin;-mabi=lp64d"
       )
     endif()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(ppc64le|ppc64|powerpc64le|powerpc64)")
+    target_compile_definitions(faiss PRIVATE COMPILE_SIMD_VSX)
+    target_compile_options(faiss PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mvsx>)
+    if(FAISS_SIMD_VSX_SRC)
+      set_source_files_properties(${FAISS_SIMD_VSX_SRC}
+        TARGET_DIRECTORY faiss
+        PROPERTIES COMPILE_OPTIONS "-mvsx"
+      )
+    endif()
   endif()
 endif()
 
@@ -684,6 +697,22 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(riscv64|riscv)" AND NOT FAISS_OPT_LEVEL STRE
       TARGET_DIRECTORY faiss
       PROPERTIES COMPILE_OPTIONS "-march=rv64gcv_zvfhmin;-mabi=lp64d"
     )
+  endif()
+endif()
+
+# VSX is baseline SIMD on modern PowerPC / PPC64 builds (POWER8+ ppc64le).
+if((FAISS_OPT_LEVEL STREQUAL "vsx") OR
+   (CMAKE_SYSTEM_PROCESSOR MATCHES "(ppc64le|ppc64|powerpc64le|powerpc64)" AND NOT FAISS_OPT_LEVEL STREQUAL "generic" AND NOT FAISS_OPT_LEVEL STREQUAL "dd"))
+  target_compile_definitions(faiss PRIVATE COMPILE_SIMD_VSX)
+  target_compile_options(faiss PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mvsx>)
+  if(FAISS_SIMD_VSX_SRC)
+    target_sources(faiss PRIVATE ${FAISS_SIMD_VSX_SRC})
+    if(NOT WIN32)
+      set_source_files_properties(${FAISS_SIMD_VSX_SRC}
+        TARGET_DIRECTORY faiss
+        PROPERTIES COMPILE_OPTIONS "-mvsx"
+      )
+    endif()
   endif()
 endif()
 

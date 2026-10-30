@@ -9,15 +9,109 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
 #include <faiss/impl/simdlib/simdlib.h>
 
+// On little-endian POWER with VSX (the default for POWER8 and later with
+// ppc64le toolchains) the operations below are implemented with 128-bit
+// VSX/AltiVec vectors. A 256-bit simdlib register is handled as two 128-bit
+// halves, which are the "lanes" referred to in the comments below.
+
+#if defined(__PPC64__) && defined(__VSX__) && defined(__BYTE_ORDER__) && \
+        (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define FAISS_SIMDLIB_PPC64_VSX 1
+#include <altivec.h>
+// altivec.h may define these as context-sensitive keyword macros, which
+// conflicts with std::vector and bool in C++ code.
+#undef vector
+#undef pixel
+#undef bool
+#endif
+
 namespace faiss {
 
+#ifdef FAISS_SIMDLIB_PPC64_VSX
+
+namespace ppc64_vsx {
+
+using ppc_u8x16 = __vector unsigned char;
+using ppc_s8x16 = __vector signed char;
+using ppc_u16x8 = __vector unsigned short;
+using ppc_u32x4 = __vector unsigned int;
+using ppc_f32x4 = __vector float;
+
+// Unaligned 128-bit loads / stores, in memory (element) order.
+inline ppc_u8x16 ld(const uint8_t* p) {
+    return vec_xl(0, p);
+}
+inline ppc_u16x8 ld(const uint16_t* p) {
+    return vec_xl(0, p);
+}
+inline ppc_u32x4 ld(const uint32_t* p) {
+    return vec_xl(0, p);
+}
+inline ppc_f32x4 ld(const float* p) {
+    return vec_xl(0, p);
+}
+inline void st(uint8_t* p, ppc_u8x16 v) {
+    vec_xst(v, 0, p);
+}
+inline void st(uint16_t* p, ppc_u16x8 v) {
+    vec_xst(v, 0, p);
+}
+inline void st(uint32_t* p, ppc_u32x4 v) {
+    vec_xst(v, 0, p);
+}
+inline void st(float* p, ppc_f32x4 v) {
+    vec_xst(v, 0, p);
+}
+
+// Bit i of the result is set iff byte i of m is 0xff (bytes must be 0x00 or
+// 0xff). Equivalent of _mm_movemask_epi8.
+inline uint32_t movemask16(ppc_u8x16 m) {
+    const ppc_u8x16 weights = {
+            1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    // word k = sum of the (weighted) bytes 4k .. 4k + 3
+    const ppc_u32x4 s = vec_sum4s(vec_and(m, weights), vec_splats(0u));
+    uint32_t t[4];
+    st(t, s);
+    return (t[0] + t[1]) | ((t[2] + t[3]) << 8);
+}
+
+inline uint32_t movemask32(ppc_u8x16 m0, ppc_u8x16 m1) {
+    return movemask16(m0) | (movemask16(m1) << 16);
+}
+
+// byte permutation controls selecting the even / odd 32-bit words
+// (resp. 16-bit halfwords) of the concatenation (a, b)
+inline ppc_u8x16 perm_even32() {
+    const ppc_u8x16 p = {0, 1, 2,  3,  8,  9,  10, 11,
+                         16, 17, 18, 19, 24, 25, 26, 27};
+    return p;
+}
+inline ppc_u8x16 perm_odd32() {
+    const ppc_u8x16 p = {4,  5,  6,  7,  12, 13, 14, 15,
+                         20, 21, 22, 23, 28, 29, 30, 31};
+    return p;
+}
+inline ppc_u8x16 perm_even16() {
+    const ppc_u8x16 p = {0,  1,  4,  5,  8,  9,  12, 13,
+                         16, 17, 20, 21, 24, 25, 28, 29};
+    return p;
+}
+inline ppc_u8x16 perm_odd16() {
+    const ppc_u8x16 p = {2,  3,  6,  7,  10, 11, 14, 15,
+                         18, 19, 22, 23, 26, 27, 30, 31};
+    return p;
+}
+
+} // namespace ppc64_vsx
+
 template <>
-struct simd256bit_tpl<SIMDLevel::NONE> {
+struct simd256bit_tpl<SIMDLevel::VSX> {
     union {
         uint8_t u8[32];
         uint16_t u16[16];
@@ -63,19 +157,16 @@ struct simd256bit_tpl<SIMDLevel::NONE> {
 
     // Checks whether the other holds exactly the same bytes.
     bool is_same_as(simd256bit_tpl other) const {
-        for (size_t i = 0; i < 8; i++) {
-            if (u32[i] != other.u32[i]) {
-                return false;
-            }
-        }
-
-        return true;
+        using namespace ppc64_vsx;
+        return vec_all_eq(ld(u32), ld(other.u32)) &&
+                vec_all_eq(ld(u32 + 4), ld(other.u32 + 4));
     }
 };
 
 /// vector of 16 elements in uint16
 template <>
-struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
+struct simd16uint16_tpl<SIMDLevel::VSX>
+        : simd256bit_tpl<SIMDLevel::VSX> {
     simd16uint16_tpl() {}
 
     explicit simd16uint16_tpl(int x) {
@@ -86,11 +177,11 @@ struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
         set1(x);
     }
 
-    explicit simd16uint16_tpl(const simd256bit_tpl<SIMDLevel::NONE>& x)
-            : simd256bit_tpl<SIMDLevel::NONE>(x) {}
+    explicit simd16uint16_tpl(const simd256bit_tpl<SIMDLevel::VSX>& x)
+            : simd256bit_tpl<SIMDLevel::VSX>(x) {}
 
     explicit simd16uint16_tpl(const uint16_t* x)
-            : simd256bit_tpl<SIMDLevel::NONE>((const void*)x) {}
+            : simd256bit_tpl<SIMDLevel::VSX>((const void*)x) {}
 
     explicit simd16uint16_tpl(
             uint16_t u0,
@@ -129,9 +220,17 @@ struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
 
     std::string elements_to_string(const char* fmt) const {
         char res[1000], *ptr = res;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
         for (int i = 0; i < 16; i++) {
-            ptr += sprintf(ptr, fmt, u16[i]);
+            ptr += snprintf(
+                    ptr, (size_t)(res + sizeof(res) - ptr), fmt, u16[i]);
         }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         // strip last ,
         ptr[-1] = 0;
         return std::string(res);
@@ -145,46 +244,41 @@ struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
         return elements_to_string("%3d,");
     }
 
-    template <typename F>
-    static simd16uint16_tpl unary_func(const simd16uint16_tpl& a, F&& f) {
-        simd16uint16_tpl c;
-        for (int j = 0; j < 16; j++) {
-            c.u16[j] = f(a.u16[j]);
-        }
-        return c;
-    }
-
-    template <typename F>
-    static simd16uint16_tpl binary_func(
-            const simd16uint16_tpl& a,
-            const simd16uint16_tpl& b,
-            F&& f) {
-        simd16uint16_tpl c;
-        for (int j = 0; j < 16; j++) {
-            c.u16[j] = f(a.u16[j], b.u16[j]);
-        }
-        return c;
-    }
-
     void set1(uint16_t x) {
-        for (int i = 0; i < 16; i++) {
-            u16[i] = x;
-        }
+        using namespace ppc64_vsx;
+        const ppc_u16x8 v = vec_splats(x);
+        st(u16, v);
+        st(u16 + 8, v);
     }
 
     simd16uint16_tpl operator*(const simd16uint16_tpl& other) const {
-        return binary_func(
-                *this, other, [](uint16_t a, uint16_t b) { return a * b; });
+        using namespace ppc64_vsx;
+        const ppc_u16x8 zero = vec_splats((uint16_t)0);
+        simd16uint16_tpl c;
+        // low 16 bits of a * b + 0
+        st(c.u16, vec_mladd(ld(u16), ld(other.u16), zero));
+        st(c.u16 + 8, vec_mladd(ld(u16 + 8), ld(other.u16 + 8), zero));
+        return c;
     }
 
-    // shift must be known at compile time
+    // shift must be known at compile time (and in [0, 15])
     simd16uint16_tpl operator>>(const int shift) const {
-        return unary_func(*this, [shift](uint16_t a) { return a >> shift; });
+        using namespace ppc64_vsx;
+        const ppc_u16x8 s = vec_splats((uint16_t)shift);
+        simd16uint16_tpl c;
+        st(c.u16, vec_sr(ld(u16), s));
+        st(c.u16 + 8, vec_sr(ld(u16 + 8), s));
+        return c;
     }
 
-    // shift must be known at compile time
+    // shift must be known at compile time (and in [0, 15])
     simd16uint16_tpl operator<<(const int shift) const {
-        return unary_func(*this, [shift](uint16_t a) { return a << shift; });
+        using namespace ppc64_vsx;
+        const ppc_u16x8 s = vec_splats((uint16_t)shift);
+        simd16uint16_tpl c;
+        st(c.u16, vec_sl(ld(u16), s));
+        st(c.u16 + 8, vec_sl(ld(u16 + 8), s));
+        return c;
     }
 
     simd16uint16_tpl& operator+=(const simd16uint16_tpl& other) {
@@ -198,48 +292,65 @@ struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
     }
 
     simd16uint16_tpl operator+(const simd16uint16_tpl& other) const {
-        return binary_func(
-                *this, other, [](uint16_t a, uint16_t b) { return a + b; });
+        using namespace ppc64_vsx;
+        simd16uint16_tpl c;
+        st(c.u16, vec_add(ld(u16), ld(other.u16)));
+        st(c.u16 + 8, vec_add(ld(u16 + 8), ld(other.u16 + 8)));
+        return c;
     }
 
     simd16uint16_tpl operator-(const simd16uint16_tpl& other) const {
-        return binary_func(
-                *this, other, [](uint16_t a, uint16_t b) { return a - b; });
+        using namespace ppc64_vsx;
+        simd16uint16_tpl c;
+        st(c.u16, vec_sub(ld(u16), ld(other.u16)));
+        st(c.u16 + 8, vec_sub(ld(u16 + 8), ld(other.u16 + 8)));
+        return c;
     }
 
     simd16uint16_tpl operator&(
-            const simd256bit_tpl<SIMDLevel::NONE>& other) const {
-        return binary_func(
-                *this, simd16uint16_tpl(other), [](uint16_t a, uint16_t b) {
-                    return a & b;
-                });
+            const simd256bit_tpl<SIMDLevel::VSX>& other) const {
+        using namespace ppc64_vsx;
+        simd16uint16_tpl c;
+        st(c.u8, vec_and(ld(u8), ld(other.u8)));
+        st(c.u8 + 16, vec_and(ld(u8 + 16), ld(other.u8 + 16)));
+        return c;
     }
 
     simd16uint16_tpl operator|(
-            const simd256bit_tpl<SIMDLevel::NONE>& other) const {
-        return binary_func(
-                *this, simd16uint16_tpl(other), [](uint16_t a, uint16_t b) {
-                    return a | b;
-                });
+            const simd256bit_tpl<SIMDLevel::VSX>& other) const {
+        using namespace ppc64_vsx;
+        simd16uint16_tpl c;
+        st(c.u8, vec_or(ld(u8), ld(other.u8)));
+        st(c.u8 + 16, vec_or(ld(u8 + 16), ld(other.u8 + 16)));
+        return c;
     }
 
     simd16uint16_tpl operator^(
-            const simd256bit_tpl<SIMDLevel::NONE>& other) const {
-        return binary_func(
-                *this, simd16uint16_tpl(other), [](uint16_t a, uint16_t b) {
-                    return a ^ b;
-                });
+            const simd256bit_tpl<SIMDLevel::VSX>& other) const {
+        using namespace ppc64_vsx;
+        simd16uint16_tpl c;
+        st(c.u8, vec_xor(ld(u8), ld(other.u8)));
+        st(c.u8 + 16, vec_xor(ld(u8 + 16), ld(other.u8 + 16)));
+        return c;
     }
 
     // returns binary masks
     simd16uint16_tpl operator==(const simd16uint16_tpl& other) const {
-        return binary_func(*this, other, [](uint16_t a, uint16_t b) {
-            return a == b ? 0xffff : 0;
-        });
+        using namespace ppc64_vsx;
+        simd16uint16_tpl c;
+        st(c.u16, (ppc_u16x8)vec_cmpeq(ld(u16), ld(other.u16)));
+        st(c.u16 + 8, (ppc_u16x8)vec_cmpeq(ld(u16 + 8), ld(other.u16 + 8)));
+        return c;
     }
 
     simd16uint16_tpl operator~() const {
-        return unary_func(*this, [](uint16_t a) { return ~a; });
+        using namespace ppc64_vsx;
+        const ppc_u8x16 a0 = ld(u8);
+        const ppc_u8x16 a1 = ld(u8 + 16);
+        simd16uint16_tpl c;
+        st(c.u8, vec_nor(a0, a0));
+        st(c.u8 + 16, vec_nor(a1, a1));
+        return c;
     }
 
     // get scalar at index 0
@@ -250,13 +361,17 @@ struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
     // mask of elements where this >= thresh
     // 2 bit per component: 16 * 2 = 32 bit
     uint32_t ge_mask(const simd16uint16_tpl& thresh) const {
-        uint32_t gem = 0;
-        for (int j = 0; j < 16; j++) {
-            if (u16[j] >= thresh.u16[j]) {
-                gem |= 3 << (j * 2);
-            }
-        }
-        return gem;
+        using namespace ppc64_vsx;
+        // a >= t  <=>  max(a, t) == a. Each 16-bit element of the comparison
+        // result is 0x0000 or 0xffff, so the byte movemask gives exactly 2
+        // bits per component.
+        const ppc_u16x8 a0 = ld(u16);
+        const ppc_u16x8 a1 = ld(u16 + 8);
+        const ppc_u16x8 m0 =
+                (ppc_u16x8)vec_cmpeq(vec_max(a0, ld(thresh.u16)), a0);
+        const ppc_u16x8 m1 =
+                (ppc_u16x8)vec_cmpeq(vec_max(a1, ld(thresh.u16 + 8)), a1);
+        return movemask32((ppc_u8x16)m0, (ppc_u8x16)m1);
     }
 
     uint32_t le_mask(const simd16uint16_tpl& thresh) const {
@@ -268,7 +383,9 @@ struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
     }
 
     bool all_gt(const simd16uint16_tpl& thresh) const {
-        return le_mask(thresh) == 0;
+        using namespace ppc64_vsx;
+        return vec_all_gt(ld(u16), ld(thresh.u16)) &&
+                vec_all_gt(ld(u16 + 8), ld(thresh.u16 + 8));
     }
 
     // for debugging only
@@ -277,108 +394,110 @@ struct simd16uint16_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
     }
 
     void accu_min(const simd16uint16_tpl& incoming) {
-        for (int j = 0; j < 16; j++) {
-            if (incoming.u16[j] < u16[j]) {
-                u16[j] = incoming.u16[j];
-            }
-        }
+        using namespace ppc64_vsx;
+        st(u16, vec_min(ld(u16), ld(incoming.u16)));
+        st(u16 + 8, vec_min(ld(u16 + 8), ld(incoming.u16 + 8)));
     }
 
     void accu_max(const simd16uint16_tpl& incoming) {
-        for (int j = 0; j < 16; j++) {
-            if (incoming.u16[j] > u16[j]) {
-                u16[j] = incoming.u16[j];
-            }
-        }
+        using namespace ppc64_vsx;
+        st(u16, vec_max(ld(u16), ld(incoming.u16)));
+        st(u16 + 8, vec_max(ld(u16 + 8), ld(incoming.u16 + 8)));
     }
 };
 
 // not really a std::min because it returns an elementwise min
-inline simd16uint16_tpl<SIMDLevel::NONE> min(
-        const simd16uint16_tpl<SIMDLevel::NONE>& av,
-        const simd16uint16_tpl<SIMDLevel::NONE>& bv) {
-    return simd16uint16_tpl<SIMDLevel::NONE>::binary_func(
-            av, bv, [](uint16_t a, uint16_t b) { return std::min(a, b); });
+inline simd16uint16_tpl<SIMDLevel::VSX> min(
+        const simd16uint16_tpl<SIMDLevel::VSX>& av,
+        const simd16uint16_tpl<SIMDLevel::VSX>& bv) {
+    using namespace ppc64_vsx;
+    simd16uint16_tpl<SIMDLevel::VSX> c;
+    st(c.u16, vec_min(ld(av.u16), ld(bv.u16)));
+    st(c.u16 + 8, vec_min(ld(av.u16 + 8), ld(bv.u16 + 8)));
+    return c;
 }
 
-inline simd16uint16_tpl<SIMDLevel::NONE> max(
-        const simd16uint16_tpl<SIMDLevel::NONE>& av,
-        const simd16uint16_tpl<SIMDLevel::NONE>& bv) {
-    return simd16uint16_tpl<SIMDLevel::NONE>::binary_func(
-            av, bv, [](uint16_t a, uint16_t b) { return std::max(a, b); });
+inline simd16uint16_tpl<SIMDLevel::VSX> max(
+        const simd16uint16_tpl<SIMDLevel::VSX>& av,
+        const simd16uint16_tpl<SIMDLevel::VSX>& bv) {
+    using namespace ppc64_vsx;
+    simd16uint16_tpl<SIMDLevel::VSX> c;
+    st(c.u16, vec_max(ld(av.u16), ld(bv.u16)));
+    st(c.u16 + 8, vec_max(ld(av.u16 + 8), ld(bv.u16 + 8)));
+    return c;
 }
 
 // decompose in 128-lanes: a = (a0, a1), b = (b0, b1)
 // return (a0 + a1, b0 + b1)
-// TODO find a better name
-inline simd16uint16_tpl<SIMDLevel::NONE> combine2x2(
-        const simd16uint16_tpl<SIMDLevel::NONE>& a,
-        const simd16uint16_tpl<SIMDLevel::NONE>& b) {
-    simd16uint16_tpl<SIMDLevel::NONE> c;
-    for (int j = 0; j < 8; j++) {
-        c.u16[j] = a.u16[j] + a.u16[j + 8];
-        c.u16[j + 8] = b.u16[j] + b.u16[j + 8];
-    }
+inline simd16uint16_tpl<SIMDLevel::VSX> combine2x2(
+        const simd16uint16_tpl<SIMDLevel::VSX>& a,
+        const simd16uint16_tpl<SIMDLevel::VSX>& b) {
+    simd16uint16_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    st(c.u16, vec_add(ld(a.u16), ld(a.u16 + 8)));
+    st(c.u16 + 8, vec_add(ld(b.u16), ld(b.u16 + 8)));
     return c;
 }
 
 // compare d0 and d1 to thr, return 32 bits corresponding to the concatenation
 // of d0 and d1 with thr
 inline uint32_t cmp_ge32(
-        const simd16uint16_tpl<SIMDLevel::NONE>& d0,
-        const simd16uint16_tpl<SIMDLevel::NONE>& d1,
-        const simd16uint16_tpl<SIMDLevel::NONE>& thr) {
-    uint32_t gem = 0;
-    for (int j = 0; j < 16; j++) {
-        if (d0.u16[j] >= thr.u16[j]) {
-            gem |= 1 << j;
-        }
-        if (d1.u16[j] >= thr.u16[j]) {
-            gem |= 1 << (j + 16);
-        }
-    }
-    return gem;
+        const simd16uint16_tpl<SIMDLevel::VSX>& d0,
+        const simd16uint16_tpl<SIMDLevel::VSX>& d1,
+        const simd16uint16_tpl<SIMDLevel::VSX>& thr) {
+    using namespace ppc64_vsx;
+    const ppc_u16x8 t0 = ld(thr.u16);
+    const ppc_u16x8 t1 = ld(thr.u16 + 8);
+    const ppc_u16x8 a0 = ld(d0.u16);
+    const ppc_u16x8 a1 = ld(d0.u16 + 8);
+    const ppc_u16x8 b0 = ld(d1.u16);
+    const ppc_u16x8 b1 = ld(d1.u16 + 8);
+    // x >= t  <=>  max(x, t) == x; vec_pack truncates the 0x0000 / 0xffff
+    // results to 0x00 / 0xff bytes, in element order
+    const ppc_u8x16 ma = vec_pack(
+            (ppc_u16x8)vec_cmpeq(vec_max(a0, t0), a0),
+            (ppc_u16x8)vec_cmpeq(vec_max(a1, t1), a1));
+    const ppc_u8x16 mb = vec_pack(
+            (ppc_u16x8)vec_cmpeq(vec_max(b0, t0), b0),
+            (ppc_u16x8)vec_cmpeq(vec_max(b1, t1), b1));
+    return movemask32(ma, mb);
 }
 
 inline uint32_t cmp_le32(
-        const simd16uint16_tpl<SIMDLevel::NONE>& d0,
-        const simd16uint16_tpl<SIMDLevel::NONE>& d1,
-        const simd16uint16_tpl<SIMDLevel::NONE>& thr) {
-    uint32_t gem = 0;
-    for (int j = 0; j < 16; j++) {
-        if (d0.u16[j] <= thr.u16[j]) {
-            gem |= 1 << j;
-        }
-        if (d1.u16[j] <= thr.u16[j]) {
-            gem |= 1 << (j + 16);
-        }
-    }
-    return gem;
+        const simd16uint16_tpl<SIMDLevel::VSX>& d0,
+        const simd16uint16_tpl<SIMDLevel::VSX>& d1,
+        const simd16uint16_tpl<SIMDLevel::VSX>& thr) {
+    using namespace ppc64_vsx;
+    const ppc_u16x8 t0 = ld(thr.u16);
+    const ppc_u16x8 t1 = ld(thr.u16 + 8);
+    const ppc_u16x8 a0 = ld(d0.u16);
+    const ppc_u16x8 a1 = ld(d0.u16 + 8);
+    const ppc_u16x8 b0 = ld(d1.u16);
+    const ppc_u16x8 b1 = ld(d1.u16 + 8);
+    // x <= t  <=>  min(x, t) == x
+    const ppc_u8x16 ma = vec_pack(
+            (ppc_u16x8)vec_cmpeq(vec_min(a0, t0), a0),
+            (ppc_u16x8)vec_cmpeq(vec_min(a1, t1), a1));
+    const ppc_u8x16 mb = vec_pack(
+            (ppc_u16x8)vec_cmpeq(vec_min(b0, t0), b0),
+            (ppc_u16x8)vec_cmpeq(vec_min(b1, t1), b1));
+    return movemask32(ma, mb);
 }
 
 // hadd does not cross lanes
-inline simd16uint16_tpl<SIMDLevel::NONE> hadd(
-        const simd16uint16_tpl<SIMDLevel::NONE>& a,
-        const simd16uint16_tpl<SIMDLevel::NONE>& b) {
-    simd16uint16_tpl<SIMDLevel::NONE> c;
-    c.u16[0] = a.u16[0] + a.u16[1];
-    c.u16[1] = a.u16[2] + a.u16[3];
-    c.u16[2] = a.u16[4] + a.u16[5];
-    c.u16[3] = a.u16[6] + a.u16[7];
-    c.u16[4] = b.u16[0] + b.u16[1];
-    c.u16[5] = b.u16[2] + b.u16[3];
-    c.u16[6] = b.u16[4] + b.u16[5];
-    c.u16[7] = b.u16[6] + b.u16[7];
-
-    c.u16[8] = a.u16[8] + a.u16[9];
-    c.u16[9] = a.u16[10] + a.u16[11];
-    c.u16[10] = a.u16[12] + a.u16[13];
-    c.u16[11] = a.u16[14] + a.u16[15];
-    c.u16[12] = b.u16[8] + b.u16[9];
-    c.u16[13] = b.u16[10] + b.u16[11];
-    c.u16[14] = b.u16[12] + b.u16[13];
-    c.u16[15] = b.u16[14] + b.u16[15];
-
+inline simd16uint16_tpl<SIMDLevel::VSX> hadd(
+        const simd16uint16_tpl<SIMDLevel::VSX>& a,
+        const simd16uint16_tpl<SIMDLevel::VSX>& b) {
+    simd16uint16_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    const ppc_u8x16 pe = perm_even16();
+    const ppc_u8x16 po = perm_odd16();
+    for (int lane = 0; lane < 2; lane++) {
+        const ppc_u16x8 al = ld(a.u16 + 8 * lane);
+        const ppc_u16x8 bl = ld(b.u16 + 8 * lane);
+        st(c.u16 + 8 * lane,
+           vec_add(vec_perm(al, bl, pe), vec_perm(al, bl, po)));
+    }
     return c;
 }
 
@@ -394,29 +513,34 @@ inline simd16uint16_tpl<SIMDLevel::NONE> hadd(
 // the last equal value is saved instead of the first one), but this behavior
 // saves instructions.
 inline void cmplt_min_max_fast(
-        const simd16uint16_tpl<SIMDLevel::NONE> candidateValues,
-        const simd16uint16_tpl<SIMDLevel::NONE> candidateIndices,
-        const simd16uint16_tpl<SIMDLevel::NONE> currentValues,
-        const simd16uint16_tpl<SIMDLevel::NONE> currentIndices,
-        simd16uint16_tpl<SIMDLevel::NONE>& minValues,
-        simd16uint16_tpl<SIMDLevel::NONE>& minIndices,
-        simd16uint16_tpl<SIMDLevel::NONE>& maxValues,
-        simd16uint16_tpl<SIMDLevel::NONE>& maxIndices) {
-    for (size_t i = 0; i < 16; i++) {
-        bool flag = (candidateValues.u16[i] < currentValues.u16[i]);
-        minValues.u16[i] = flag ? candidateValues.u16[i] : currentValues.u16[i];
-        minIndices.u16[i] =
-                flag ? candidateIndices.u16[i] : currentIndices.u16[i];
-        maxValues.u16[i] =
-                !flag ? candidateValues.u16[i] : currentValues.u16[i];
-        maxIndices.u16[i] =
-                !flag ? candidateIndices.u16[i] : currentIndices.u16[i];
+        const simd16uint16_tpl<SIMDLevel::VSX> candidateValues,
+        const simd16uint16_tpl<SIMDLevel::VSX> candidateIndices,
+        const simd16uint16_tpl<SIMDLevel::VSX> currentValues,
+        const simd16uint16_tpl<SIMDLevel::VSX> currentIndices,
+        simd16uint16_tpl<SIMDLevel::VSX>& minValues,
+        simd16uint16_tpl<SIMDLevel::VSX>& minIndices,
+        simd16uint16_tpl<SIMDLevel::VSX>& maxValues,
+        simd16uint16_tpl<SIMDLevel::VSX>& maxIndices) {
+    using namespace ppc64_vsx;
+    for (int lane = 0; lane < 2; lane++) {
+        const int o = 8 * lane;
+        const ppc_u16x8 cv = ld(candidateValues.u16 + o);
+        const ppc_u16x8 ci = ld(candidateIndices.u16 + o);
+        const ppc_u16x8 uv = ld(currentValues.u16 + o);
+        const ppc_u16x8 ui = ld(currentIndices.u16 + o);
+        // flag mask: candidate < current
+        const ppc_u16x8 flag = (ppc_u16x8)vec_cmplt(cv, uv);
+        st(minValues.u16 + o, vec_sel(uv, cv, flag));
+        st(minIndices.u16 + o, vec_sel(ui, ci, flag));
+        st(maxValues.u16 + o, vec_sel(cv, uv, flag));
+        st(maxIndices.u16 + o, vec_sel(ci, ui, flag));
     }
 }
 
 // vector of 32 unsigned 8-bit integers
 template <>
-struct simd32uint8_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
+struct simd32uint8_tpl<SIMDLevel::VSX>
+        : simd256bit_tpl<SIMDLevel::VSX> {
     simd32uint8_tpl() {}
 
     explicit simd32uint8_tpl(int x) {
@@ -459,54 +583,32 @@ struct simd32uint8_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
             uint8_t _29,
             uint8_t _30,
             uint8_t _31>
-    static simd32uint8_tpl create() {
-        simd32uint8_tpl ret;
-        ret.u8[0] = _0;
-        ret.u8[1] = _1;
-        ret.u8[2] = _2;
-        ret.u8[3] = _3;
-        ret.u8[4] = _4;
-        ret.u8[5] = _5;
-        ret.u8[6] = _6;
-        ret.u8[7] = _7;
-        ret.u8[8] = _8;
-        ret.u8[9] = _9;
-        ret.u8[10] = _10;
-        ret.u8[11] = _11;
-        ret.u8[12] = _12;
-        ret.u8[13] = _13;
-        ret.u8[14] = _14;
-        ret.u8[15] = _15;
-        ret.u8[16] = _16;
-        ret.u8[17] = _17;
-        ret.u8[18] = _18;
-        ret.u8[19] = _19;
-        ret.u8[20] = _20;
-        ret.u8[21] = _21;
-        ret.u8[22] = _22;
-        ret.u8[23] = _23;
-        ret.u8[24] = _24;
-        ret.u8[25] = _25;
-        ret.u8[26] = _26;
-        ret.u8[27] = _27;
-        ret.u8[28] = _28;
-        ret.u8[29] = _29;
-        ret.u8[30] = _30;
-        ret.u8[31] = _31;
-        return ret;
+    void set() {
+        const uint8_t x[32] = {
+                _0,  _1,  _2,  _3,  _4,  _5,  _6,  _7,  _8,  _9,  _10,
+                _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, _21,
+                _22, _23, _24, _25, _26, _27, _28, _29, _30, _31};
+        loadu(x);
     }
 
-    explicit simd32uint8_tpl(const simd256bit_tpl<SIMDLevel::NONE>& x)
-            : simd256bit_tpl<SIMDLevel::NONE>(x) {}
+    explicit simd32uint8_tpl(const simd256bit_tpl<SIMDLevel::VSX>& x)
+            : simd256bit_tpl<SIMDLevel::VSX>(x) {}
 
     explicit simd32uint8_tpl(const uint8_t* x)
-            : simd256bit_tpl<SIMDLevel::NONE>((const void*)x) {}
+            : simd256bit_tpl<SIMDLevel::VSX>((const void*)x) {}
 
     std::string elements_to_string(const char* fmt) const {
         char res[1000], *ptr = res;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
         for (int i = 0; i < 32; i++) {
-            ptr += sprintf(ptr, fmt, u8[i]);
+            ptr += snprintf(ptr, (size_t)(res + sizeof(res) - ptr), fmt, u8[i]);
         }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         // strip last ,
         ptr[-1] = 0;
         return std::string(res);
@@ -521,166 +623,103 @@ struct simd32uint8_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
     }
 
     void set1(uint8_t x) {
-        for (int j = 0; j < 32; j++) {
-            u8[j] = x;
-        }
-    }
-
-    template <typename F>
-    static simd32uint8_tpl binary_func(
-            const simd32uint8_tpl& a,
-            const simd32uint8_tpl& b,
-            F&& f) {
-        simd32uint8_tpl c;
-        for (int j = 0; j < 32; j++) {
-            c.u8[j] = f(a.u8[j], b.u8[j]);
-        }
-        return c;
+        using namespace ppc64_vsx;
+        const ppc_u8x16 v = vec_splats(x);
+        st(u8, v);
+        st(u8 + 16, v);
     }
 
     simd32uint8_tpl operator&(
-            const simd256bit_tpl<SIMDLevel::NONE>& other) const {
-        return binary_func(
-                *this, simd32uint8_tpl(other), [](uint8_t a, uint8_t b) {
-                    return a & b;
-                });
+            const simd256bit_tpl<SIMDLevel::VSX>& other) const {
+        using namespace ppc64_vsx;
+        simd32uint8_tpl c;
+        st(c.u8, vec_and(ld(u8), ld(other.u8)));
+        st(c.u8 + 16, vec_and(ld(u8 + 16), ld(other.u8 + 16)));
+        return c;
     }
 
     simd32uint8_tpl operator+(const simd32uint8_tpl& other) const {
-        return binary_func(
-                *this, other, [](uint8_t a, uint8_t b) { return a + b; });
+        using namespace ppc64_vsx;
+        simd32uint8_tpl c;
+        st(c.u8, vec_add(ld(u8), ld(other.u8)));
+        st(c.u8 + 16, vec_add(ld(u8 + 16), ld(other.u8 + 16)));
+        return c;
     }
 
     // The very important operation that everything relies on
     simd32uint8_tpl lookup_2_lanes(const simd32uint8_tpl& idx) const {
         simd32uint8_tpl c;
-        // The original for loop:
-        // for (int j = 0; j < 32; j++) {
-        //     if (idx.u8[j] & 0x80) {
-        //         c.u8[j] = 0;
-        //     } else {
-        //         uint8_t i = idx.u8[j] & 15;
-        //         if (j < 16) {
-        //             c.u8[j] = u8[i];
-        //         } else {
-        //             c.u8[j] = u8[16 + i];
-        //         }
-        //     }
-
-        // The following function was re-written for Power 10
-        // The loop was unrolled to remove the if (j < 16) statement by doing
-        // the j and j + 16 iterations in parallel.  The additional unrolling
-        // for j + 1 and j + 17, reduces the execution time on Power 10 by
-        // about 50% as the instruction scheduling allows on average 2X more
-        // instructions to be issued per cycle.
-
-        for (int j = 0; j < 16; j = j + 2) {
-            // j < 16, unrolled to depth of 2
-            if (idx.u8[j] & 0x80) {
-                c.u8[j] = 0;
-            } else {
-                uint8_t i = idx.u8[j] & 15;
-                c.u8[j] = u8[i];
-            }
-
-            if (idx.u8[j + 1] & 0x80) {
-                c.u8[j + 1] = 0;
-            } else {
-                uint8_t i = idx.u8[j + 1] & 15;
-                c.u8[j + 1] = u8[i];
-            }
-
-            // j >= 16, unrolled to depth of 2
-            if (idx.u8[j + 16] & 0x80) {
-                c.u8[j + 16] = 0;
-            } else {
-                uint8_t i = idx.u8[j + 16] & 15;
-                c.u8[j + 16] = u8[i + 16];
-            }
-
-            if (idx.u8[j + 17] & 0x80) {
-                c.u8[j + 17] = 0;
-            } else {
-                uint8_t i = idx.u8[j + 17] & 15;
-                c.u8[j + 17] = u8[i + 16];
-            }
+        // Each 16-byte lane is a table; vperm does the lookup in a single
+        // instruction. Only the low bits of the control bytes are used by
+        // vperm, so they are masked to 0..15 and bytes with the MSB set are
+        // zeroed afterwards.
+        using namespace ppc64_vsx;
+        const ppc_u8x16 low_nibble = vec_splats((uint8_t)0x0f);
+        const ppc_s8x16 zero = vec_splats((signed char)0);
+        for (int lane = 0; lane < 2; lane++) {
+            const ppc_u8x16 table = ld(u8 + 16 * lane);
+            const ppc_u8x16 ix = ld(idx.u8 + 16 * lane);
+            const ppc_u8x16 looked_up =
+                    vec_perm(table, table, vec_and(ix, low_nibble));
+            const ppc_u8x16 msb_set = (ppc_u8x16)vec_cmplt((ppc_s8x16)ix, zero);
+            st(c.u8 + 16 * lane, vec_andc(looked_up, msb_set));
         }
         return c;
     }
-
-    // extract + 0-extend lane
-    // this operation is slow (3 cycles)
-
-    simd32uint8_tpl& operator+=(const simd32uint8_tpl& other) {
-        *this = *this + other;
-        return *this;
-    }
-
-    // for debugging only
-    uint8_t operator[](int i) const {
-        return u8[i];
-    }
 };
 
-// convert with saturation
-// careful: this does not cross lanes, so the order is weird
-inline simd32uint8_tpl<SIMDLevel::NONE> uint16_to_uint8_saturate(
-        const simd16uint16_tpl<SIMDLevel::NONE>& a,
-        const simd16uint16_tpl<SIMDLevel::NONE>& b) {
-    simd32uint8_tpl<SIMDLevel::NONE> c;
-
-    auto saturate_16_to_8 = [](uint16_t x) { return x >= 256 ? 0xff : x; };
-
-    for (int i = 0; i < 8; i++) {
-        c.u8[i] = saturate_16_to_8(a.u16[i]);
-        c.u8[8 + i] = saturate_16_to_8(b.u16[i]);
-        c.u8[16 + i] = saturate_16_to_8(a.u16[8 + i]);
-        c.u8[24 + i] = saturate_16_to_8(b.u16[8 + i]);
-    }
+inline simd32uint8_tpl<SIMDLevel::VSX> uint16_to_uint8_saturate(
+        const simd16uint16_tpl<SIMDLevel::VSX>& a,
+        const simd16uint16_tpl<SIMDLevel::VSX>& b) {
+    simd32uint8_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    // lane 0: (sat(a0), sat(b0)), lane 1: (sat(a1), sat(b1))
+    st(c.u8, vec_packs(ld(a.u16), ld(b.u16)));
+    st(c.u8 + 16, vec_packs(ld(a.u16 + 8), ld(b.u16 + 8)));
     return c;
 }
 
 /// get most significant bit of each byte
-inline uint32_t get_MSBs(const simd32uint8_tpl<SIMDLevel::NONE>& a) {
-    uint32_t res = 0;
-    for (int i = 0; i < 32; i++) {
-        if (a.u8[i] & 0x80) {
-            res |= 1 << i;
-        }
-    }
-    return res;
+inline uint32_t get_MSBs(const simd32uint8_tpl<SIMDLevel::VSX>& a) {
+    using namespace ppc64_vsx;
+    const ppc_s8x16 zero = vec_splats((signed char)0);
+    return movemask32(
+            (ppc_u8x16)vec_cmplt((ppc_s8x16)ld(a.u8), zero),
+            (ppc_u8x16)vec_cmplt((ppc_s8x16)ld(a.u8 + 16), zero));
 }
 
 /// use MSB of each byte of mask to select a byte between a and b
-inline simd32uint8_tpl<SIMDLevel::NONE> blendv(
-        const simd32uint8_tpl<SIMDLevel::NONE>& a,
-        const simd32uint8_tpl<SIMDLevel::NONE>& b,
-        const simd32uint8_tpl<SIMDLevel::NONE>& mask) {
-    simd32uint8_tpl<SIMDLevel::NONE> c;
-    for (int i = 0; i < 32; i++) {
-        if (mask.u8[i] & 0x80) {
-            c.u8[i] = b.u8[i];
-        } else {
-            c.u8[i] = a.u8[i];
-        }
+inline simd32uint8_tpl<SIMDLevel::VSX> blendv(
+        const simd32uint8_tpl<SIMDLevel::VSX>& a,
+        const simd32uint8_tpl<SIMDLevel::VSX>& b,
+        const simd32uint8_tpl<SIMDLevel::VSX>& mask) {
+    simd32uint8_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    const ppc_s8x16 zero = vec_splats((signed char)0);
+    for (int lane = 0; lane < 2; lane++) {
+        const int o = 16 * lane;
+        const ppc_u8x16 m =
+                (ppc_u8x16)vec_cmplt((ppc_s8x16)ld(mask.u8 + o), zero);
+        st(c.u8 + o, vec_sel(ld(a.u8 + o), ld(b.u8 + o), m));
     }
     return c;
 }
 
-/// vector of 8 unsigned 32-bit integers
+// vector of 8 unsigned 32-bit integers
 template <>
-struct simd8uint32_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
+struct simd8uint32_tpl<SIMDLevel::VSX>
+        : simd256bit_tpl<SIMDLevel::VSX> {
     simd8uint32_tpl() {}
 
     explicit simd8uint32_tpl(uint32_t x) {
         set1(x);
     }
 
-    explicit simd8uint32_tpl(const simd256bit_tpl<SIMDLevel::NONE>& x)
-            : simd256bit_tpl<SIMDLevel::NONE>(x) {}
+    explicit simd8uint32_tpl(const simd256bit_tpl<SIMDLevel::VSX>& x)
+            : simd256bit_tpl<SIMDLevel::VSX>(x) {}
 
     explicit simd8uint32_tpl(const uint32_t* x)
-            : simd256bit_tpl<SIMDLevel::NONE>((const void*)x) {}
+            : simd256bit_tpl<SIMDLevel::VSX>((const void*)x) {}
 
     explicit simd8uint32_tpl(
             uint32_t u0,
@@ -691,58 +730,29 @@ struct simd8uint32_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
             uint32_t u5,
             uint32_t u6,
             uint32_t u7) {
-        u32[0] = u0;
-        u32[1] = u1;
-        u32[2] = u2;
-        u32[3] = u3;
-        u32[4] = u4;
-        u32[5] = u5;
-        u32[6] = u6;
-        u32[7] = u7;
-    }
-
-    simd8uint32_tpl operator+(simd8uint32_tpl other) const {
-        simd8uint32_tpl result;
-        for (int i = 0; i < 8; i++) {
-            result.u32[i] = u32[i] + other.u32[i];
-        }
-        return result;
-    }
-
-    simd8uint32_tpl operator-(simd8uint32_tpl other) const {
-        simd8uint32_tpl result;
-        for (int i = 0; i < 8; i++) {
-            result.u32[i] = u32[i] - other.u32[i];
-        }
-        return result;
-    }
-
-    simd8uint32_tpl& operator+=(const simd8uint32_tpl& other) {
-        for (int i = 0; i < 8; i++) {
-            u32[i] += other.u32[i];
-        }
-        return *this;
-    }
-
-    bool operator==(simd8uint32_tpl other) const {
-        for (size_t i = 0; i < 8; i++) {
-            if (u32[i] != other.u32[i]) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    bool operator!=(simd8uint32_tpl other) const {
-        return !(*this == other);
+        this->u32[0] = u0;
+        this->u32[1] = u1;
+        this->u32[2] = u2;
+        this->u32[3] = u3;
+        this->u32[4] = u4;
+        this->u32[5] = u5;
+        this->u32[6] = u6;
+        this->u32[7] = u7;
     }
 
     std::string elements_to_string(const char* fmt) const {
         char res[1000], *ptr = res;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
         for (int i = 0; i < 8; i++) {
-            ptr += sprintf(ptr, fmt, u32[i]);
+            ptr += snprintf(
+                    ptr, (size_t)(res + sizeof(res) - ptr), fmt, u32[i]);
         }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         // strip last ,
         ptr[-1] = 0;
         return std::string(res);
@@ -756,134 +766,169 @@ struct simd8uint32_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
         return elements_to_string("%10d,");
     }
 
+    simd8uint32_tpl operator+(simd8uint32_tpl other) const {
+        simd8uint32_tpl result;
+        using namespace ppc64_vsx;
+        st(result.u32, vec_add(ld(u32), ld(other.u32)));
+        st(result.u32 + 4, vec_add(ld(u32 + 4), ld(other.u32 + 4)));
+        return result;
+    }
+
+    simd8uint32_tpl operator-(simd8uint32_tpl other) const {
+        simd8uint32_tpl result;
+        using namespace ppc64_vsx;
+        st(result.u32, vec_sub(ld(u32), ld(other.u32)));
+        st(result.u32 + 4, vec_sub(ld(u32 + 4), ld(other.u32 + 4)));
+        return result;
+    }
+
+    simd8uint32_tpl& operator+=(const simd8uint32_tpl& other) {
+        using namespace ppc64_vsx;
+        st(u32, vec_add(ld(u32), ld(other.u32)));
+        st(u32 + 4, vec_add(ld(u32 + 4), ld(other.u32 + 4)));
+        return *this;
+    }
+
+    bool operator==(simd8uint32_tpl other) const {
+        using namespace ppc64_vsx;
+        return vec_all_eq(ld(u32), ld(other.u32)) &&
+                vec_all_eq(ld(u32 + 4), ld(other.u32 + 4));
+    }
+
+    bool operator!=(simd8uint32_tpl other) const {
+        return !(*this == other);
+    }
+
+    // get scalar at index 0
+    uint32_t get_scalar_0() const {
+        return u32[0];
+    }
+
+    // for debugging only
+    uint32_t operator[](int i) const {
+        return u32[i];
+    }
+
     void set1(uint32_t x) {
-        for (int i = 0; i < 8; i++) {
-            u32[i] = x;
-        }
+        using namespace ppc64_vsx;
+        const ppc_u32x4 v = vec_splats(x);
+        st(u32, v);
+        st(u32 + 4, v);
     }
 
     simd8uint32_tpl unzip() const {
-        const uint32_t ret[] = {
-                u32[0], u32[2], u32[4], u32[6], u32[1], u32[3], u32[5], u32[7]};
-        return simd8uint32_tpl{ret};
+        using namespace ppc64_vsx;
+        // (u0 u2 u4 u6 | u1 u3 u5 u7): even words of the 256-bit register,
+        // then odd words
+        const ppc_u32x4 h0 = ld(u32);
+        const ppc_u32x4 h1 = ld(u32 + 4);
+        simd8uint32_tpl ret;
+        st(ret.u32, vec_perm(h0, h1, perm_even32()));
+        st(ret.u32 + 4, vec_perm(h0, h1, perm_odd32()));
+        return ret;
     }
 };
 
-// Vectorized version of the following code:
-//   for (size_t i = 0; i < n; i++) {
-//      bool flag = (candidateValues[i] < currentValues[i]);
-//      minValues[i] = flag ? candidateValues[i] : currentValues[i];
-//      minIndices[i] = flag ? candidateIndices[i] : currentIndices[i];
-//      maxValues[i] = !flag ? candidateValues[i] : currentValues[i];
-//      maxIndices[i] = !flag ? candidateIndices[i] : currentIndices[i];
-//   }
-// Max indices evaluation is inaccurate in case of equal values (the index of
-// the last equal value is saved instead of the first one), but this behavior
-// saves instructions.
 inline void cmplt_min_max_fast(
-        const simd8uint32_tpl<SIMDLevel::NONE> candidateValues,
-        const simd8uint32_tpl<SIMDLevel::NONE> candidateIndices,
-        const simd8uint32_tpl<SIMDLevel::NONE> currentValues,
-        const simd8uint32_tpl<SIMDLevel::NONE> currentIndices,
-        simd8uint32_tpl<SIMDLevel::NONE>& minValues,
-        simd8uint32_tpl<SIMDLevel::NONE>& minIndices,
-        simd8uint32_tpl<SIMDLevel::NONE>& maxValues,
-        simd8uint32_tpl<SIMDLevel::NONE>& maxIndices) {
-    for (size_t i = 0; i < 8; i++) {
-        bool flag = (candidateValues.u32[i] < currentValues.u32[i]);
-        minValues.u32[i] = flag ? candidateValues.u32[i] : currentValues.u32[i];
-        minIndices.u32[i] =
-                flag ? candidateIndices.u32[i] : currentIndices.u32[i];
-        maxValues.u32[i] =
-                !flag ? candidateValues.u32[i] : currentValues.u32[i];
-        maxIndices.u32[i] =
-                !flag ? candidateIndices.u32[i] : currentIndices.u32[i];
+        const simd8uint32_tpl<SIMDLevel::VSX> candidateValues,
+        const simd8uint32_tpl<SIMDLevel::VSX> candidateIndices,
+        const simd8uint32_tpl<SIMDLevel::VSX> currentValues,
+        const simd8uint32_tpl<SIMDLevel::VSX> currentIndices,
+        simd8uint32_tpl<SIMDLevel::VSX>& minValues,
+        simd8uint32_tpl<SIMDLevel::VSX>& minIndices,
+        simd8uint32_tpl<SIMDLevel::VSX>& maxValues,
+        simd8uint32_tpl<SIMDLevel::VSX>& maxIndices) {
+    using namespace ppc64_vsx;
+    for (int lane = 0; lane < 2; lane++) {
+        const int o = 4 * lane;
+        const ppc_u32x4 cv = ld(candidateValues.u32 + o);
+        const ppc_u32x4 ci = ld(candidateIndices.u32 + o);
+        const ppc_u32x4 uv = ld(currentValues.u32 + o);
+        const ppc_u32x4 ui = ld(currentIndices.u32 + o);
+        const ppc_u32x4 flag = (ppc_u32x4)vec_cmplt(cv, uv);
+        st(minValues.u32 + o, vec_sel(uv, cv, flag));
+        st(minIndices.u32 + o, vec_sel(ui, ci, flag));
+        st(maxValues.u32 + o, vec_sel(cv, uv, flag));
+        st(maxIndices.u32 + o, vec_sel(ci, ui, flag));
     }
 }
 
 template <>
-struct simd8float32_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
+struct simd8float32_tpl<SIMDLevel::VSX>
+        : simd256bit_tpl<SIMDLevel::VSX> {
     simd8float32_tpl() {}
-
-    explicit simd8float32_tpl(const simd256bit_tpl<SIMDLevel::NONE>& x)
-            : simd256bit_tpl<SIMDLevel::NONE>(x) {}
 
     explicit simd8float32_tpl(float x) {
         set1(x);
     }
 
-    explicit simd8float32_tpl(const float* x) {
-        loadu((void*)x);
-    }
-
     void set1(float x) {
-        for (int i = 0; i < 8; i++) {
-            f32[i] = x;
-        }
+        using namespace ppc64_vsx;
+        const ppc_f32x4 v = vec_splats(x);
+        st(f32, v);
+        st(f32 + 4, v);
     }
 
     explicit simd8float32_tpl(
-            float f0,
-            float f1,
-            float f2,
-            float f3,
-            float f4,
-            float f5,
-            float f6,
-            float f7) {
-        f32[0] = f0;
-        f32[1] = f1;
-        f32[2] = f2;
-        f32[3] = f3;
-        f32[4] = f4;
-        f32[5] = f5;
-        f32[6] = f6;
-        f32[7] = f7;
+            float u0,
+            float u1,
+            float u2,
+            float u3,
+            float u4,
+            float u5,
+            float u6,
+            float u7) {
+        this->f32[0] = u0;
+        this->f32[1] = u1;
+        this->f32[2] = u2;
+        this->f32[3] = u3;
+        this->f32[4] = u4;
+        this->f32[5] = u5;
+        this->f32[6] = u6;
+        this->f32[7] = u7;
     }
 
-    template <typename F>
-    static simd8float32_tpl binary_func(
-            const simd8float32_tpl& a,
-            const simd8float32_tpl& b,
-            F&& f) {
+    explicit simd8float32_tpl(const simd256bit_tpl<SIMDLevel::VSX>& x)
+            : simd256bit_tpl<SIMDLevel::VSX>(x) {}
+
+    explicit simd8float32_tpl(const float* x)
+            : simd256bit_tpl<SIMDLevel::VSX>((const void*)x) {}
+
+    simd8float32_tpl operator*(const simd8float32_tpl& other) const {
+        using namespace ppc64_vsx;
         simd8float32_tpl c;
-        for (int j = 0; j < 8; j++) {
-            c.f32[j] = f(a.f32[j], b.f32[j]);
-        }
+        st(c.f32, vec_mul(ld(f32), ld(other.f32)));
+        st(c.f32 + 4, vec_mul(ld(f32 + 4), ld(other.f32 + 4)));
         return c;
     }
 
-    simd8float32_tpl operator*(const simd8float32_tpl& other) const {
-        return binary_func(
-                *this, other, [](float a, float b) { return a * b; });
-    }
-
     simd8float32_tpl operator+(const simd8float32_tpl& other) const {
-        return binary_func(
-                *this, other, [](float a, float b) { return a + b; });
+        using namespace ppc64_vsx;
+        simd8float32_tpl c;
+        st(c.f32, vec_add(ld(f32), ld(other.f32)));
+        st(c.f32 + 4, vec_add(ld(f32 + 4), ld(other.f32 + 4)));
+        return c;
     }
 
     simd8float32_tpl operator-(const simd8float32_tpl& other) const {
-        return binary_func(
-                *this, other, [](float a, float b) { return a - b; });
+        using namespace ppc64_vsx;
+        simd8float32_tpl c;
+        st(c.f32, vec_sub(ld(f32), ld(other.f32)));
+        st(c.f32 + 4, vec_sub(ld(f32 + 4), ld(other.f32 + 4)));
+        return c;
     }
 
     simd8float32_tpl& operator+=(const simd8float32_tpl& other) {
-        for (size_t i = 0; i < 8; i++) {
-            f32[i] += other.f32[i];
-        }
-
+        using namespace ppc64_vsx;
+        st(f32, vec_add(ld(f32), ld(other.f32)));
+        st(f32 + 4, vec_add(ld(f32 + 4), ld(other.f32 + 4)));
         return *this;
     }
 
     bool operator==(simd8float32_tpl other) const {
-        for (size_t i = 0; i < 8; i++) {
-            if (f32[i] != other.f32[i]) {
-                return false;
-            }
-        }
-
-        return true;
+        using namespace ppc64_vsx;
+        return vec_all_eq(ld(f32), ld(other.f32)) &&
+                vec_all_eq(ld(f32 + 4), ld(other.f32 + 4));
     }
 
     bool operator!=(simd8float32_tpl other) const {
@@ -892,9 +937,17 @@ struct simd8float32_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
 
     std::string tostring() const {
         char res[1000], *ptr = res;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#endif
         for (int i = 0; i < 8; i++) {
-            ptr += sprintf(ptr, "%g,", f32[i]);
+            ptr += snprintf(
+                    ptr, (size_t)(res + sizeof(res) - ptr), "%g,", f32[i]);
         }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         // strip last ,
         ptr[-1] = 0;
         return std::string(res);
@@ -902,144 +955,99 @@ struct simd8float32_tpl<SIMDLevel::NONE> : simd256bit_tpl<SIMDLevel::NONE> {
 };
 
 // hadd does not cross lanes
-inline simd8float32_tpl<SIMDLevel::NONE> hadd(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b) {
-    simd8float32_tpl<SIMDLevel::NONE> c;
-    c.f32[0] = a.f32[0] + a.f32[1];
-    c.f32[1] = a.f32[2] + a.f32[3];
-    c.f32[2] = b.f32[0] + b.f32[1];
-    c.f32[3] = b.f32[2] + b.f32[3];
-
-    c.f32[4] = a.f32[4] + a.f32[5];
-    c.f32[5] = a.f32[6] + a.f32[7];
-    c.f32[6] = b.f32[4] + b.f32[5];
-    c.f32[7] = b.f32[6] + b.f32[7];
-
+inline simd8float32_tpl<SIMDLevel::VSX> hadd(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b) {
+    simd8float32_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    const ppc_u8x16 pe = perm_even32();
+    const ppc_u8x16 po = perm_odd32();
+    for (int lane = 0; lane < 2; lane++) {
+        const ppc_f32x4 al = ld(a.f32 + 4 * lane);
+        const ppc_f32x4 bl = ld(b.f32 + 4 * lane);
+        st(c.f32 + 4 * lane,
+           vec_add(vec_perm(al, bl, pe), vec_perm(al, bl, po)));
+    }
     return c;
 }
 
-inline simd8float32_tpl<SIMDLevel::NONE> unpacklo(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b) {
-    simd8float32_tpl<SIMDLevel::NONE> c;
-    c.f32[0] = a.f32[0];
-    c.f32[1] = b.f32[0];
-    c.f32[2] = a.f32[1];
-    c.f32[3] = b.f32[1];
-
-    c.f32[4] = a.f32[4];
-    c.f32[5] = b.f32[4];
-    c.f32[6] = a.f32[5];
-    c.f32[7] = b.f32[5];
-
+inline simd8float32_tpl<SIMDLevel::VSX> unpacklo(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b) {
+    simd8float32_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    st(c.f32, vec_mergeh(ld(a.f32), ld(b.f32)));
+    st(c.f32 + 4, vec_mergeh(ld(a.f32 + 4), ld(b.f32 + 4)));
     return c;
 }
 
-inline simd8float32_tpl<SIMDLevel::NONE> unpackhi(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b) {
-    simd8float32_tpl<SIMDLevel::NONE> c;
-    c.f32[0] = a.f32[2];
-    c.f32[1] = b.f32[2];
-    c.f32[2] = a.f32[3];
-    c.f32[3] = b.f32[3];
-
-    c.f32[4] = a.f32[6];
-    c.f32[5] = b.f32[6];
-    c.f32[6] = a.f32[7];
-    c.f32[7] = b.f32[7];
-
+inline simd8float32_tpl<SIMDLevel::VSX> unpackhi(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b) {
+    simd8float32_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    st(c.f32, vec_mergel(ld(a.f32), ld(b.f32)));
+    st(c.f32 + 4, vec_mergel(ld(a.f32 + 4), ld(b.f32 + 4)));
     return c;
 }
 
 // compute a * b + c
-inline simd8float32_tpl<SIMDLevel::NONE> fmadd(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b,
-        const simd8float32_tpl<SIMDLevel::NONE>& c) {
-    simd8float32_tpl<SIMDLevel::NONE> res;
-    for (int i = 0; i < 8; i++) {
-        res.f32[i] = a.f32[i] * b.f32[i] + c.f32[i];
-    }
+inline simd8float32_tpl<SIMDLevel::VSX> fmadd(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b,
+        const simd8float32_tpl<SIMDLevel::VSX>& c) {
+    simd8float32_tpl<SIMDLevel::VSX> res;
+    using namespace ppc64_vsx;
+    st(res.f32, vec_madd(ld(a.f32), ld(b.f32), ld(c.f32)));
+    st(res.f32 + 4, vec_madd(ld(a.f32 + 4), ld(b.f32 + 4), ld(c.f32 + 4)));
     return res;
 }
 
 namespace {
 
 // get even float32's of a and b, interleaved
-simd8float32_tpl<SIMDLevel::NONE> geteven(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b) {
-    simd8float32_tpl<SIMDLevel::NONE> c;
-
-    c.f32[0] = a.f32[0];
-    c.f32[1] = a.f32[2];
-    c.f32[2] = b.f32[0];
-    c.f32[3] = b.f32[2];
-
-    c.f32[4] = a.f32[4];
-    c.f32[5] = a.f32[6];
-    c.f32[6] = b.f32[4];
-    c.f32[7] = b.f32[6];
-
+inline simd8float32_tpl<SIMDLevel::VSX> geteven(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b) {
+    simd8float32_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    const ppc_u8x16 pe = perm_even32();
+    st(c.f32, vec_perm(ld(a.f32), ld(b.f32), pe));
+    st(c.f32 + 4, vec_perm(ld(a.f32 + 4), ld(b.f32 + 4), pe));
     return c;
 }
 
 // get odd float32's of a and b, interleaved
-simd8float32_tpl<SIMDLevel::NONE> getodd(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b) {
-    simd8float32_tpl<SIMDLevel::NONE> c;
-
-    c.f32[0] = a.f32[1];
-    c.f32[1] = a.f32[3];
-    c.f32[2] = b.f32[1];
-    c.f32[3] = b.f32[3];
-
-    c.f32[4] = a.f32[5];
-    c.f32[5] = a.f32[7];
-    c.f32[6] = b.f32[5];
-    c.f32[7] = b.f32[7];
-
+inline simd8float32_tpl<SIMDLevel::VSX> getodd(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b) {
+    simd8float32_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    const ppc_u8x16 po = perm_odd32();
+    st(c.f32, vec_perm(ld(a.f32), ld(b.f32), po));
+    st(c.f32 + 4, vec_perm(ld(a.f32 + 4), ld(b.f32 + 4), po));
     return c;
 }
 
 // 3 cycles
 // if the lanes are a = [a0 a1] and b = [b0 b1], return [a0 b0]
-simd8float32_tpl<SIMDLevel::NONE> getlow128(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b) {
-    simd8float32_tpl<SIMDLevel::NONE> c;
-
-    c.f32[0] = a.f32[0];
-    c.f32[1] = a.f32[1];
-    c.f32[2] = a.f32[2];
-    c.f32[3] = a.f32[3];
-
-    c.f32[4] = b.f32[0];
-    c.f32[5] = b.f32[1];
-    c.f32[6] = b.f32[2];
-    c.f32[7] = b.f32[3];
-
+inline simd8float32_tpl<SIMDLevel::VSX> getlow128(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b) {
+    simd8float32_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    st(c.f32, ld(a.f32));
+    st(c.f32 + 4, ld(b.f32));
     return c;
 }
 
-simd8float32_tpl<SIMDLevel::NONE> gethigh128(
-        const simd8float32_tpl<SIMDLevel::NONE>& a,
-        const simd8float32_tpl<SIMDLevel::NONE>& b) {
-    simd8float32_tpl<SIMDLevel::NONE> c;
-
-    c.f32[0] = a.f32[4];
-    c.f32[1] = a.f32[5];
-    c.f32[2] = a.f32[6];
-    c.f32[3] = a.f32[7];
-
-    c.f32[4] = b.f32[4];
-    c.f32[5] = b.f32[5];
-    c.f32[6] = b.f32[6];
-    c.f32[7] = b.f32[7];
-
+inline simd8float32_tpl<SIMDLevel::VSX> gethigh128(
+        const simd8float32_tpl<SIMDLevel::VSX>& a,
+        const simd8float32_tpl<SIMDLevel::VSX>& b) {
+    simd8float32_tpl<SIMDLevel::VSX> c;
+    using namespace ppc64_vsx;
+    st(c.f32, ld(a.f32 + 4));
+    st(c.f32 + 4, ld(b.f32 + 4));
     return c;
 }
 
@@ -1075,16 +1083,21 @@ simd8float32_tpl<SIMDLevel::NONE> gethigh128(
 // confusion for ppl who write in low-level SIMD instructions. Additionally,
 // these two ops (cmp and blend) are very often used together.
 inline void cmplt_and_blend_inplace(
-        const simd8float32_tpl<SIMDLevel::NONE> candidateValues,
-        const simd8uint32_tpl<SIMDLevel::NONE> candidateIndices,
-        simd8float32_tpl<SIMDLevel::NONE>& lowestValues,
-        simd8uint32_tpl<SIMDLevel::NONE>& lowestIndices) {
-    for (size_t j = 0; j < 8; j++) {
-        bool comparison = (candidateValues.f32[j] < lowestValues.f32[j]);
-        if (comparison) {
-            lowestValues.f32[j] = candidateValues.f32[j];
-            lowestIndices.u32[j] = candidateIndices.u32[j];
-        }
+        const simd8float32_tpl<SIMDLevel::VSX> candidateValues,
+        const simd8uint32_tpl<SIMDLevel::VSX> candidateIndices,
+        simd8float32_tpl<SIMDLevel::VSX>& lowestValues,
+        simd8uint32_tpl<SIMDLevel::VSX>& lowestIndices) {
+    using namespace ppc64_vsx;
+    for (int lane = 0; lane < 2; lane++) {
+        const int o = 4 * lane;
+        const ppc_f32x4 cv = ld(candidateValues.f32 + o);
+        const ppc_f32x4 lv = ld(lowestValues.f32 + o);
+        const ppc_u32x4 mask = (ppc_u32x4)vec_cmplt(cv, lv);
+        st(lowestValues.f32 + o, vec_sel(lv, cv, mask));
+        st(lowestIndices.u32 + o,
+           vec_sel(ld(lowestIndices.u32 + o),
+                   ld(candidateIndices.u32 + o),
+                   mask));
     }
 }
 
@@ -1100,26 +1113,40 @@ inline void cmplt_and_blend_inplace(
 // the last equal value is saved instead of the first one), but this behavior
 // saves instructions.
 inline void cmplt_min_max_fast(
-        const simd8float32_tpl<SIMDLevel::NONE> candidateValues,
-        const simd8uint32_tpl<SIMDLevel::NONE> candidateIndices,
-        const simd8float32_tpl<SIMDLevel::NONE> currentValues,
-        const simd8uint32_tpl<SIMDLevel::NONE> currentIndices,
-        simd8float32_tpl<SIMDLevel::NONE>& minValues,
-        simd8uint32_tpl<SIMDLevel::NONE>& minIndices,
-        simd8float32_tpl<SIMDLevel::NONE>& maxValues,
-        simd8uint32_tpl<SIMDLevel::NONE>& maxIndices) {
-    for (size_t i = 0; i < 8; i++) {
-        bool flag = (candidateValues.f32[i] < currentValues.f32[i]);
-        minValues.f32[i] = flag ? candidateValues.f32[i] : currentValues.f32[i];
-        minIndices.u32[i] =
-                flag ? candidateIndices.u32[i] : currentIndices.u32[i];
-        maxValues.f32[i] =
-                !flag ? candidateValues.f32[i] : currentValues.f32[i];
-        maxIndices.u32[i] =
-                !flag ? candidateIndices.u32[i] : currentIndices.u32[i];
+        const simd8float32_tpl<SIMDLevel::VSX> candidateValues,
+        const simd8uint32_tpl<SIMDLevel::VSX> candidateIndices,
+        const simd8float32_tpl<SIMDLevel::VSX> currentValues,
+        const simd8uint32_tpl<SIMDLevel::VSX> currentIndices,
+        simd8float32_tpl<SIMDLevel::VSX>& minValues,
+        simd8uint32_tpl<SIMDLevel::VSX>& minIndices,
+        simd8float32_tpl<SIMDLevel::VSX>& maxValues,
+        simd8uint32_tpl<SIMDLevel::VSX>& maxIndices) {
+    using namespace ppc64_vsx;
+    for (int lane = 0; lane < 2; lane++) {
+        const int o = 4 * lane;
+        const ppc_f32x4 cv = ld(candidateValues.f32 + o);
+        const ppc_u32x4 ci = ld(candidateIndices.u32 + o);
+        const ppc_f32x4 uv = ld(currentValues.f32 + o);
+        const ppc_u32x4 ui = ld(currentIndices.u32 + o);
+        const ppc_u32x4 flag = (ppc_u32x4)vec_cmplt(cv, uv);
+        st(minValues.f32 + o, vec_sel(uv, cv, flag));
+        st(minIndices.u32 + o, vec_sel(ui, ci, flag));
+        st(maxValues.f32 + o, vec_sel(cv, uv, flag));
+        st(maxIndices.u32 + o, vec_sel(ci, ui, flag));
     }
 }
 
+// horizontal add: sum all 8 floats in the register
+inline float horizontal_add(const simd8float32_tpl<SIMDLevel::VSX>& a) {
+    using namespace ppc64_vsx;
+    const ppc_f32x4 s = vec_add(ld(a.f32), ld(a.f32 + 4));
+    float t[4];
+    st(t, s);
+    return (t[0] + t[1]) + (t[2] + t[3]);
+}
+
 } // namespace
+
+#endif // FAISS_SIMDLIB_PPC64_VSX
 
 } // namespace faiss

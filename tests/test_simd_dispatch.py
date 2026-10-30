@@ -69,6 +69,7 @@ def get_available_simd_levels():
         "ARM_NEON",
         "ARM_SVE",
         "RISCV_RVV",
+        "VSX",
     ]
     levels = []
     for name in names:

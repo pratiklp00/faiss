@@ -179,6 +179,9 @@ uint64_t compiled_simd_levels() {
 #ifdef COMPILE_SIMD_RISCV_RVV
     mask |= uint64_t(1) << static_cast<int>(SIMDLevel::RISCV_RVV);
 #endif
+#if defined(COMPILE_SIMD_VSX) || defined(COMPILE_SIMD_PPC_VSX)
+    mask |= uint64_t(1) << static_cast<int>(SIMDLevel::VSX);
+#endif
     return mask;
 }
 
@@ -359,6 +362,18 @@ SIMDLevel SIMDConfig::auto_detect_simd_level() {
     detected_level = SIMDLevel::RISCV_RVV;
 #endif
 
+#if defined(__PPC64__) && (defined(COMPILE_SIMD_VSX) || defined(COMPILE_SIMD_PPC_VSX))
+#if defined(__builtin_cpu_supports)
+    if (__builtin_cpu_supports("vsx")) {
+        supported_simd_levels |= (1 << static_cast<int>(SIMDLevel::VSX));
+        detected_level = SIMDLevel::VSX;
+    }
+#elif defined(__VSX__)
+    supported_simd_levels |= (1 << static_cast<int>(SIMDLevel::VSX));
+    detected_level = SIMDLevel::VSX;
+#endif
+#endif
+
     return detected_level;
 }
 
@@ -433,6 +448,8 @@ SIMDLevel SIMDConfig::auto_detect_simd_level() {
     return SIMDLevel::ARM_NEON;
 #elif defined(COMPILE_SIMD_RISCV_RVV)
     return SIMDLevel::RISCV_RVV;
+#elif defined(COMPILE_SIMD_VSX) || defined(COMPILE_SIMD_PPC_VSX)
+    return SIMDLevel::VSX;
 #else
     return SIMDLevel::NONE;
 #endif
@@ -467,6 +484,8 @@ std::string to_string(SIMDLevel level) {
             return "ARM_SVE";
         case SIMDLevel::RISCV_RVV:
             return "RISCV_RVV";
+        case SIMDLevel::VSX:
+            return "VSX";
         case SIMDLevel::COUNT:
         default:
             throw FaissException("Invalid SIMDLevel");
@@ -497,6 +516,9 @@ SIMDLevel to_simd_level(const std::string& level_str) {
     }
     if (level_str == "RISCV_RVV") {
         return SIMDLevel::RISCV_RVV;
+    }
+    if (level_str == "VSX" || level_str == "PPC_VSX") {
+        return SIMDLevel::VSX;
     }
 
     throw FaissException("Invalid SIMD level string: " + level_str);

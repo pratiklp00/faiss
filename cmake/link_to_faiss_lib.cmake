@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 function(link_to_faiss_lib target)
-  if(NOT FAISS_OPT_LEVEL STREQUAL "avx2" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512_spr" AND NOT FAISS_OPT_LEVEL STREQUAL "sve" AND NOT FAISS_OPT_LEVEL STREQUAL "dd")
+  if(NOT FAISS_OPT_LEVEL STREQUAL "avx2" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512_spr" AND NOT FAISS_OPT_LEVEL STREQUAL "sve" AND NOT FAISS_OPT_LEVEL STREQUAL "vsx" AND NOT FAISS_OPT_LEVEL STREQUAL "dd")
     target_link_libraries(${target} PRIVATE faiss)
   endif()
 
@@ -64,6 +64,14 @@ function(link_to_faiss_lib target)
     target_link_libraries(${target} PRIVATE faiss_sve)
   endif()
 
+  if(FAISS_OPT_LEVEL STREQUAL "vsx")
+    if(NOT WIN32)
+      target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mvsx>)
+    endif()
+    target_compile_definitions(${target} PRIVATE COMPILE_SIMD_VSX)
+    target_link_libraries(${target} PRIVATE faiss)
+  endif()
+
   if(FAISS_OPT_LEVEL STREQUAL "dd")
     # DD mode: link to main faiss library with DD-specific definitions
     # When FAISS_OPT_LEVEL=dd, the main faiss library is built with DD enabled,
@@ -82,6 +90,10 @@ function(link_to_faiss_lib target)
       target_compile_definitions(${target} PRIVATE COMPILE_SIMD_AVX2 COMPILE_SIMD_AVX512)
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
       target_compile_definitions(${target} PRIVATE COMPILE_SIMD_ARM_NEON)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(riscv64|riscv)")
+      target_compile_definitions(${target} PRIVATE COMPILE_SIMD_RISCV_RVV)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(ppc64le|ppc64|powerpc64le|powerpc64)")
+      target_compile_definitions(${target} PRIVATE COMPILE_SIMD_VSX)
     endif()
     target_link_libraries(${target} PRIVATE faiss)
   endif()

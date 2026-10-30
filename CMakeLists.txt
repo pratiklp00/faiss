@@ -84,7 +84,7 @@ set(CMAKE_CXX_STANDARD 20)
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
-# Valid values are "generic", "avx2", "avx512", "avx512_spr", "sve".
+# Valid values are "generic", "avx2", "avx512", "avx512_spr", "sve", "vsx".
 option(FAISS_OPT_LEVEL "" "generic")
 option(FAISS_ENABLE_GPU "Enable support for GPU indexes." ON)
 option(FAISS_GPU_STATIC "Link GPU libraries statically." OFF)

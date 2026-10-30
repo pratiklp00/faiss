@@ -37,6 +37,9 @@ enum class SIMDLevel {
     // (Ice Lake, Zen 4, etc.).
     AVX512_VPOPCNT,
 
+    // IBM POWER / PPC64 VSX
+    VSX,
+
     COUNT
 };
 
@@ -95,6 +98,12 @@ enum class SIMDLevel {
 #define FAISS_SIMD_TU_RISCV_RVV 0
 #endif
 
+#if (defined(COMPILE_SIMD_VSX) || defined(COMPILE_SIMD_PPC_VSX)) && defined(__VSX__)
+#define FAISS_SIMD_TU_VSX 1
+#else
+#define FAISS_SIMD_TU_VSX 0
+#endif
+
 #define FAISS_SIMD_TU(level) FAISS_SIMD_TU_##level
 
 #endif // SWIG
@@ -114,6 +123,8 @@ enum class SIMDLevel {
 // so the baseline is ARM_NEON. On x86, the baseline is NONE.
 #if defined(COMPILE_SIMD_ARM_NEON)
 inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::ARM_NEON;
+#elif defined(COMPILE_SIMD_VSX) || defined(COMPILE_SIMD_PPC_VSX)
+inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::VSX;
 #else
 inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::NONE;
 #endif
@@ -132,6 +143,8 @@ inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::ARM_SVE;
 inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::ARM_NEON;
 #elif defined(COMPILE_SIMD_RISCV_RVV)
 inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::RISCV_RVV;
+#elif defined(COMPILE_SIMD_VSX) || defined(COMPILE_SIMD_PPC_VSX)
+inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::VSX;
 #else
 inline constexpr SIMDLevel SINGLE_SIMD_LEVEL = SIMDLevel::NONE;
 #endif
@@ -153,8 +166,8 @@ struct simd256_level_selector {
              SL == SIMDLevel::AVX512_SPR)
             ? SIMDLevel::AVX2
             : (SL == SIMDLevel::ARM_SVE             ? SIMDLevel::ARM_NEON
-                       : SL == SIMDLevel::RISCV_RVV ? SIMDLevel::NONE
-                                                    : SL);
+                        : SL == SIMDLevel::RISCV_RVV ? SIMDLevel::NONE
+                                                     : SL);
 };
 
 /// SINGLE_SIMD_LEVEL mapped to 256-bit: use this for 256-bit simd types
@@ -176,8 +189,9 @@ struct simd512_level_selector {
     static constexpr SIMDLevel value =
             (SL == SIMDLevel::AVX512_SPR || SL == SIMDLevel::AVX512_VPOPCNT)
             ? SIMDLevel::AVX512
-            : (SL == SIMDLevel::RISCV_RVV) ? SIMDLevel::NONE
-                                           : SL;
+            : (SL == SIMDLevel::RISCV_RVV || SL == SIMDLevel::VSX)
+            ? SIMDLevel::NONE
+            : SL;
 };
 
 /// SINGLE_SIMD_LEVEL mapped to 512-bit: use this for 512-bit simd types
@@ -200,7 +214,9 @@ constexpr int simd_width() {
             SL == SIMDLevel::AVX512 || SL == SIMDLevel::AVX512_VPOPCNT ||
             SL == SIMDLevel::AVX512_SPR) {
         return 16;
-    } else if constexpr (SL == SIMDLevel::AVX2 || SL == SIMDLevel::ARM_NEON) {
+    } else if constexpr (
+            SL == SIMDLevel::AVX2 || SL == SIMDLevel::ARM_NEON ||
+            SL == SIMDLevel::VSX) {
         return 8;
     } else {
         return 1;

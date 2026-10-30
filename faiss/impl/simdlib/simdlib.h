@@ -48,10 +48,5 @@ struct simd16float32_tpl : simd512bit_tpl<SL> {};
 
 // NONE specialization — always included.
 // Provides simd16uint16_tpl<NONE> etc. (scalar fallback).
-// On PPC64: uses PPC-optimized scalar code (hand-tuned loop unrolling).
-// Elsewhere: generic scalar implementation.
-#if defined(__PPC64__)
-#include <faiss/impl/simdlib/simdlib_ppc64.h>
-#else
 #include <faiss/impl/simdlib/simdlib_emulated.h>
-#endif
+

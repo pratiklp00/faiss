@@ -3147,6 +3147,8 @@ SIMDLevel_ARM_NEON: int
 SIMDLevel_ARM_SVE: int
 SIMDLevel_RISCV_RVV: int
 SIMDLevel_AVX512_VPOPCNT: int
+SIMDLevel_VSX: int
+SIMDLevel_PPC_VSX: int
 SIMDLevel_COUNT: int
 
 def compiled_simd_levels() -> int: ...

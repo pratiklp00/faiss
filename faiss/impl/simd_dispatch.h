@@ -30,7 +30,8 @@ namespace faiss {
 constexpr int AVAILABLE_SIMD_LEVELS_NONE = (1 << int(SIMDLevel::NONE));
 
 constexpr int AVAILABLE_SIMD_LEVELS_AVX2_NEON = AVAILABLE_SIMD_LEVELS_NONE |
-        (1 << int(SIMDLevel::AVX2)) | (1 << int(SIMDLevel::ARM_NEON));
+        (1 << int(SIMDLevel::AVX2)) | (1 << int(SIMDLevel::ARM_NEON)) |
+        (1 << int(SIMDLevel::VSX));
 
 // BASE: AVX2_NEON + AVX512 + RISCV_RVV
 constexpr int AVAILABLE_SIMD_LEVELS_BASE = AVAILABLE_SIMD_LEVELS_AVX2_NEON |
@@ -73,6 +74,7 @@ constexpr SIMDLevel get_simd_fallback(SIMDLevel level) {
         case SIMDLevel::AVX2:
         case SIMDLevel::ARM_NEON:
         case SIMDLevel::RISCV_RVV:
+        case SIMDLevel::VSX:
             return SIMDLevel::NONE;
         default:
             return SIMDLevel::NONE;
@@ -182,6 +184,13 @@ inline auto with_selected_simd_levels(LambdaType&& action) {
             }
             [[fallthrough]];
 #endif
+#if defined(COMPILE_SIMD_VSX) || defined(COMPILE_SIMD_PPC_VSX)
+        case SIMDLevel::VSX:
+            if constexpr (available_levels & (1 << int(SIMDLevel::VSX))) {
+                return action.template operator()<SIMDLevel::VSX>();
+            }
+            [[fallthrough]];
+#endif
         default:
             return action.template operator()<SIMDLevel::NONE>();
     }
@@ -192,6 +201,7 @@ inline auto with_selected_simd_levels(LambdaType&& action) {
     //   x86:   AVX512_SPR -> AVX512_VPOPCNT -> AVX512 -> AVX2 -> NONE
     //   ARM:   ARM_SVE -> ARM_NEON -> NONE
     //   RISCV: RISCV_RVV -> NONE
+    //   PPC:   VSX -> NONE
     // The first level in the chain that appears in available_levels is
     // selected; if none match, NONE is used unconditionally.
     return dispatch_with_fallback<available_levels, SINGLE_SIMD_LEVEL>(

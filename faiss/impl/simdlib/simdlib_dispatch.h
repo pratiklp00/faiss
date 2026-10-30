@@ -35,6 +35,10 @@
 
 #include <faiss/impl/simdlib/simdlib_neon.h>
 
+#elif FAISS_SIMD_TU(VSX)
+
+#include <faiss/impl/simdlib/simdlib_ppc64.h>
+
 #endif
 
 // No global bare-name aliases (simd16uint16, simd32uint8, etc.) — each file
