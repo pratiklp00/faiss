@@ -49,4 +49,3 @@ struct simd16float32_tpl : simd512bit_tpl<SL> {};
 // NONE specialization — always included.
 // Provides simd16uint16_tpl<NONE> etc. (scalar fallback).
 #include <faiss/impl/simdlib/simdlib_emulated.h>
-

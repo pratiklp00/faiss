@@ -20,6 +20,11 @@
 // Include <arm_neon.h> at global scope so the NEON types it declares
 // (uint8x16_t, uint16x8_t, ...) end up in `::` and not inside `faiss::`.
 #include <arm_neon.h>
+#elif defined(__PPC64__) && defined(__VSX__)
+#include <altivec.h>
+#undef vector
+#undef pixel
+#undef bool
 #endif
 
 /* The Hamming distance type */
@@ -157,7 +162,63 @@ inline hamdis_t hamming(const uint64_t* pa, const uint64_t* pb, size_t nwords) {
     return h;
 }
 
-#else // !__aarch64__
+#elif defined(__PPC64__) && defined(__VSX__)
+
+/* Hamming distances for multiples of 64 bits — PowerPC optimized */
+template <>
+inline hamdis_t hamming<128>(const uint64_t* pa, const uint64_t* pb) {
+    return popcount64(pa[0] ^ pb[0]) + popcount64(pa[1] ^ pb[1]);
+}
+
+template <>
+inline hamdis_t hamming<256>(const uint64_t* pa, const uint64_t* pb) {
+    int s0 = popcount64(pa[0] ^ pb[0]) + popcount64(pa[1] ^ pb[1]);
+    int s1 = popcount64(pa[2] ^ pb[2]) + popcount64(pa[3] ^ pb[3]);
+    return s0 + s1;
+}
+
+template <size_t nbits>
+inline hamdis_t hamming(const uint64_t* pa, const uint64_t* pb) {
+    constexpr size_t nwords256 = nbits / 256;
+    constexpr size_t nwords128 = (nbits - nwords256 * 256) / 128;
+    constexpr size_t nwords64 =
+            (nbits - nwords256 * 256 - nwords128 * 128) / 64;
+
+    hamdis_t h = 0;
+    if constexpr (nwords256 > 0) {
+        for (size_t i = 0; i < nwords256; i++) {
+            h += hamming<256>(pa, pb);
+            pa += 4;
+            pb += 4;
+        }
+    }
+    if constexpr (nwords128 > 0) {
+        h += hamming<128>(pa, pb);
+        pa += 2;
+        pb += 2;
+    }
+    if constexpr (nwords64 > 0) {
+        h += hamming<64>(pa, pb);
+    }
+    return h;
+}
+
+inline hamdis_t hamming(const uint64_t* pa, const uint64_t* pb, size_t nwords) {
+    size_t i = 0;
+    int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    for (; i + 4 <= nwords; i += 4) {
+        s0 += popcount64(pa[i] ^ pb[i]);
+        s1 += popcount64(pa[i + 1] ^ pb[i + 1]);
+        s2 += popcount64(pa[i + 2] ^ pb[i + 2]);
+        s3 += popcount64(pa[i + 3] ^ pb[i + 3]);
+    }
+    for (; i < nwords; i++) {
+        s0 += popcount64(pa[i] ^ pb[i]);
+    }
+    return (s0 + s1) + (s2 + s3);
+}
+
+#else // !__aarch64__ && !(__PPC64__ && __VSX__)
 
 /* Hamming distances for multiples of 64 bits — scalar version */
 template <size_t nbits>

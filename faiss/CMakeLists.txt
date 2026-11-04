@@ -86,6 +86,17 @@ set(FAISS_SIMD_RVV_SRC
   utils/distances_fused/rvv.cpp
 )
 set(FAISS_SIMD_VSX_SRC
+  impl/fast_scan/impl-vsx.cpp
+  impl/scalar_quantizer/sq-vsx.cpp
+  impl/approx_topk/vsx.cpp
+  impl/binary_hamming/vsx.cpp
+  impl/pq_code_distance/vsx.cpp
+  utils/simd_impl/distances_vsx.cpp
+  utils/simd_impl/fp16_kernels_vsx.cpp
+  utils/hamming_distance/hamming_vsx.cpp
+  utils/simd_impl/partitioning_vsx.cpp
+  utils/distances_fused/vsx.cpp
+  utils/simd_impl/rabitq_vsx.cpp
 )
 # Select SIMD sources based on target architecture
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64)")

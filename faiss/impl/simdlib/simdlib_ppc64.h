@@ -646,6 +646,28 @@ struct simd32uint8_tpl<SIMDLevel::VSX>
         return c;
     }
 
+    simd32uint8_tpl& operator+=(const simd32uint8_tpl& other) {
+        *this = *this + other;
+        return *this;
+    }
+
+    simd32uint8_tpl operator-(const simd32uint8_tpl& other) const {
+        using namespace ppc64_vsx;
+        simd32uint8_tpl c;
+        st(c.u8, vec_sub(ld(u8), ld(other.u8)));
+        st(c.u8 + 16, vec_sub(ld(u8 + 16), ld(other.u8 + 16)));
+        return c;
+    }
+
+    simd32uint8_tpl& operator-=(const simd32uint8_tpl& other) {
+        *this = *this - other;
+        return *this;
+    }
+
+    uint8_t operator[](int i) const {
+        return u8[i];
+    }
+
     // The very important operation that everything relies on
     simd32uint8_tpl lookup_2_lanes(const simd32uint8_tpl& idx) const {
         simd32uint8_tpl c;
@@ -1003,7 +1025,6 @@ inline simd8float32_tpl<SIMDLevel::VSX> fmadd(
     return res;
 }
 
-namespace {
 
 // get even float32's of a and b, interleaved
 inline simd8float32_tpl<SIMDLevel::VSX> geteven(
@@ -1144,8 +1165,6 @@ inline float horizontal_add(const simd8float32_tpl<SIMDLevel::VSX>& a) {
     st(t, s);
     return (t[0] + t[1]) + (t[2] + t[3]);
 }
-
-} // namespace
 
 #endif // FAISS_SIMDLIB_PPC64_VSX
 
